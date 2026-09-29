@@ -1,0 +1,790 @@
+/**
+ * @file BFF → FastAPI 后端代理客户端（前后端分离迁移）
+ *
+ * 职责（OQ-3：JWT 由 BFF HttpOnly Cookie 托管）：
+ *   - 从 HttpOnly Cookie 读取 JWT 对（access / refresh），转发时注入 Authorization 头
+ *   - 收到 401 时静默调用后端 /auth/refresh 轮换令牌并重试一次（OQ-7）
+ *   - 把后端 snake_case 响应翻译为前端既有契约（camelCase 等）
+ *
+ * 后端地址：BACKEND_URL（默认 http://localhost:9000）
+ */
+
+import 'server-only';
+
+import { NextResponse } from 'next/server';
+import { getCookieValue } from '@/shared/security/security';
+import { isDemoActive, markBackendUnreachable, resolveDemoMock } from '@/shared/demo/demo-mode';
+// 副作用导入：注册演示模式 mock 路由表（幂等，仅在服务端加载）
+import '@/shared/demo/mock-data';
+import type { SafeUser, UserRole } from '@/shared/types';
+import type { components } from '@/shared/api/backend-api';
+
+/** 后端 OpenAPI 组件 schema（由 openapi.baseline.json 生成，ER-47 契约对齐） */
+type Api = components['schemas'];
+
+/** 后端基地址 */
+export const BACKEND_URL = (process.env.BACKEND_URL || 'http://localhost:9000').replace(/\/+$/, '');
+const API_PREFIX = '/api/v1';
+
+/** JWT Cookie 名称（HttpOnly；生产用 __Host- 前缀强制 Secure+Path=/） */
+const HOST_PREFIX = process.env.NODE_ENV === 'production' ? '__Host-' : '';
+export const ACCESS_COOKIE = `${HOST_PREFIX}fztbu_access`;
+export const REFRESH_COOKIE = `${HOST_PREFIX}fztbu_refresh`;
+
+const ACCESS_MAX_AGE = 15 * 60; // 与后端 ACCESS_TOKEN_EXPIRE_MINUTES 对齐
+const REFRESH_MAX_AGE = 7 * 24 * 60 * 60;
+
+/** 后端统一错误响应体（ErrorResponse，camelCase 传输契约） */
+export interface BackendErrorBody {
+  success?: boolean;
+  errorCode?: string;
+  message?: string;
+  statusCode?: number;
+  details?: Record<string, unknown>;
+  tracebackId?: string;
+}
+
+/** 后端 TokenPair（camelCase 传输契约，对齐 OpenAPI TokenPair） */
+export type BackendTokenPair = Api['TokenPair'];
+
+/** 后端 UserOut（camelCase 传输契约，对齐 OpenAPI UserOut） */
+export type BackendUser = Api['UserOut'];
+
+/** 代理结果：body + 需要应用到响应的 cookie 操作 */
+export interface ProxyResult {
+  status: number;
+  body: unknown;
+  /** 401 且刷新失败：需要清除 Cookie（登出态） */
+  clearAuth: boolean;
+  /** 轮换后的新 JWT 对（仅当本轮发生 401 静默刷新时存在，需写回 Cookie） */
+  authPair?: BackendTokenPair;
+}
+
+/** 把后端角色列表解析为前端主角色（root > admin > 细粒度 > user） */
+export function resolvePrimaryRole(roles?: string[]): UserRole {
+  if (!roles || roles.length === 0) return 'user';
+  const order: UserRole[] = ['root', 'admin', 'content_moderator', 'exam_admin', 'task_publisher'];
+  for (const candidate of order) {
+    if (roles.includes(candidate)) return candidate;
+  }
+  return 'user';
+}
+
+/** 后端 UserOut → 前端 SafeUser（is_superuser 视为 root；否则由 roles 解析） */
+export function toSafeUserFromBackend(user: BackendUser, roles?: string[]): SafeUser {
+  // SQLite→PG 迁移后超级用户被映射为 admin 角色 + is_superuser=true（不再有独立 root 角色）。
+  // is_superuser 在后端 RBAC 中拥有全部权限（rbac.py 旁路），语义等价 root，
+  // 因此优先于显式角色列表解析为 root，保证 root 专属 UI/端点对超级用户可见。
+  const role = user.isSuperuser
+    ? 'root'
+    : resolvePrimaryRole(roles);
+  return {
+    id: String(user.id),
+    email: user.email,
+    displayName: user.displayName ?? null,
+    bio: user.bio ?? null,
+    avatarUrl: user.avatarUrl ?? null,
+    avatarType: user.avatarType ?? 'initial',
+    githubUrl: user.githubUrl ?? null,
+    websiteUrl: user.websiteUrl ?? null,
+    techTags: Array.isArray(user.techTags) ? user.techTags : [],
+    role,
+    isActive: user.isActive !== false,
+    createdAt: user.createdAt ?? '',
+    updatedAt: user.updatedAt ?? '',
+  };
+}
+
+/** 从响应读取 JWT 对（无则 null） */
+function readPair(req: Request): { access: string | null; refresh: string | null } {
+  return {
+    access: getCookieValue(req, ACCESS_COOKIE),
+    refresh: getCookieValue(req, REFRESH_COOKIE),
+  };
+}
+
+/** 后端网络层不可达标记错误（requestJson 内部使用，proxyBackend 捕获后 mock 兜底） */
+class BackendUnreachableError extends Error {
+  constructor() {
+    super('BACKEND_UNREACHABLE');
+    this.name = 'BackendUnreachableError';
+  }
+}
+
+/** 后端请求超时：网络黑洞时避免 TTL 过期重试卡顿（ECONNREFUSED 即时返回不受影响） */
+const BACKEND_FETCH_TIMEOUT_MS = 3_000;
+
+/** 带超时的 fetch（仅限建立连接阶段；流式响应返回后不受影响） */
+async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), BACKEND_FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: ac.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** 请求后端并把错误体规范化为 {error, code?} */
+async function requestJson(path: string, init: RequestInit): Promise<{ status: number; body: unknown }> {
+  let res: Response;
+  try {
+    res = await fetchWithTimeout(`${BACKEND_URL}${API_PREFIX}${path}`, {
+      ...init,
+      cache: 'no-store',
+      headers: { ...(init.headers as Record<string, string> | undefined) },
+    });
+  } catch {
+    // 后端网络层不可达（含超时）：标记自动降级（TTL 内后续请求直接进演示），并抛专用错误供上层 mock 兜底
+    markBackendUnreachable();
+    throw new BackendUnreachableError();
+  }
+  let body: unknown = null;
+  const text = await res.text();
+  if (text) {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = text;
+    }
+  }
+  return { status: res.status, body };
+}
+
+/** 用 refresh token 换新对；失败返回 null */
+async function refreshPair(refreshToken: string): Promise<BackendTokenPair | null> {
+  const { status, body } = await requestJson('/auth/refresh', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ refreshToken: refreshToken }),
+  });
+  if (status !== 200 || !body || typeof body !== 'object' || !('accessToken' in body)) {
+    return null;
+  }
+  return body as BackendTokenPair;
+}
+
+/** 登录/注册成功后用 JWT 对直取用户信息（含角色） */
+export async function fetchMeWithPair(
+  pair: BackendTokenPair,
+): Promise<{ user: SafeUser; roles: string[] } | null> {
+  let status: number;
+  let body: unknown;
+  try {
+    ({ status, body } = await requestJson('/auth/me', {
+      headers: { Authorization: `Bearer ${pair.accessToken}` },
+    }));
+  } catch (err) {
+    // 后端不可达（自动/手动演示）：回落到 mock /auth/me（登录闭环的关键兜底）
+    if (err instanceof BackendUnreachableError) {
+      const demo = resolveDemoMock('/auth/me', 'GET');
+      if (demo) {
+        ({ status, body } = demo.route.respond({ searchParams: demo.searchParams, pathParams: demo.pathParams }));
+      } else {
+        return null;
+      }
+    } else {
+      throw err;
+    }
+  }
+  if (status !== 200 || !body || typeof body !== 'object') return null;
+  const b = body as { user?: BackendUser; roles?: string[] };
+  if (!b.user) return null;
+  return { user: toSafeUserFromBackend(b.user, b.roles), roles: b.roles ?? [] };
+}
+
+/**
+ * 取角色列表：优先用刚轮换出的新 pair（避免旧 token 已被轮换导致再次 401），
+ * 否则走常规代理（内部处理 401 刷新）。
+ */
+export async function fetchRolesForRequest(
+  req: Request,
+  authPair?: BackendTokenPair,
+): Promise<string[]> {
+  if (authPair) {
+    const me = await fetchMeWithPair(authPair);
+    return me?.roles ?? [];
+  }
+  const me = await proxyBackend(req, { path: '/auth/me' });
+  if (me.status !== 200 || !me.body || typeof me.body !== 'object') return [];
+  return (me.body as { roles?: string[] }).roles ?? [];
+}
+
+/** 取当前用户 id（未登录返回 null；可选登录场景用） */
+export async function fetchCurrentUserId(req: Request): Promise<string | null> {
+  const me = await proxyBackend(req, { path: '/auth/me' });
+  if (me.status !== 200 || !me.body || typeof me.body !== 'object') return null;
+  const user = (me.body as { user?: BackendUser }).user;
+  return user ? String(user.id) : null;
+}
+
+/**
+ * 代理请求到后端：演示模式优先 mock；否则注入 Authorization → 401 时刷新一次并重试 → 返回结果与 cookie 操作。
+ *
+ * @param opts.skipAuth  认证端点（登录/注册/验证码/OAuth）为 true：不注入 Authorization
+ * @param accessOverride 刷新后重试时注入的新 access token
+ */
+export async function proxyBackend(
+  req: Request,
+  opts: {
+    path: string;
+    method?: string;
+    jsonBody?: unknown;
+    formData?: FormData;
+    skipAuth?: boolean;
+    headers?: Record<string, string>;
+  },
+  retried = false,
+  accessOverride?: string,
+): Promise<ProxyResult> {
+  // 演示模式主拦截：手动/自动激活时优先走 mock，避免误连真实后端
+  if (isDemoActive(req)) {
+    const demo = resolveDemoMock(opts.path, opts.method || 'GET');
+    if (demo) {
+      const { status, body } = demo.route.respond({
+        searchParams: demo.searchParams,
+        pathParams: demo.pathParams,
+        body: opts.jsonBody,
+      });
+      return { status, body, clearAuth: false };
+    }
+    return {
+      status: 404,
+      body: { message: '演示模式暂未覆盖该接口', errorCode: 'DEMO_NOT_IMPLEMENTED' },
+      clearAuth: false,
+    };
+  }
+
+  try {
+    const { access, refresh } = readPair(req);
+
+    const headers: Record<string, string> = { ...(opts.headers ?? {}) };
+    if (!opts.skipAuth && (accessOverride ?? access)) {
+      headers.Authorization = `Bearer ${accessOverride ?? access}`;
+    }
+    let body: BodyInit | undefined;
+    if (opts.formData) {
+      body = opts.formData;
+    } else if (opts.jsonBody !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      body = JSON.stringify(opts.jsonBody);
+    }
+
+    const first = await requestJson(opts.path, {
+      method: opts.method || 'GET',
+      headers,
+      body,
+    });
+
+    if (first.status === 401 && !opts.skipAuth && refresh && !retried) {
+      const pair = await refreshPair(refresh);
+      if (pair) {
+        const retriedResult = await proxyBackend(req, opts, true, pair.accessToken);
+        return { ...retriedResult, authPair: pair };
+      }
+      return { status: first.status, body: first.body, clearAuth: true };
+    }
+
+    return { status: first.status, body: first.body, clearAuth: false };
+  } catch (err) {
+    // 后端网络层不可达：requestJson 已置自动降级标记，此处尝试 mock 兜底（本次请求直接演示）
+    if (err instanceof BackendUnreachableError) {
+      markBackendUnreachable();
+      const demo = resolveDemoMock(opts.path, opts.method || 'GET');
+      if (demo) {
+        const { status, body } = demo.route.respond({
+          searchParams: demo.searchParams,
+          pathParams: demo.pathParams,
+          body: opts.jsonBody,
+        });
+        return { status, body, clearAuth: false };
+      }
+      return {
+        status: 502,
+        body: { message: '后端服务暂不可达，已进入演示模式', errorCode: 'BACKEND_UNREACHABLE' },
+        clearAuth: false,
+      };
+    }
+    throw err;
+  }
+}
+
+/**
+ * SSE 流式透传：注入 Authorization 后把后端响应体原样 pipe 给客户端。
+ * 用于学习助手对话（stream: true），不做 JSON 解析与 401 自动刷新（前端处理）。
+ * 演示模式：流式接口不提供 mock，明确返回占位错误。
+ */
+export async function proxyStream(
+  req: Request,
+  opts: { path: string; method?: string; jsonBody?: unknown },
+): Promise<Response> {
+  // 演示模式：流式接口（学习助手 SSE）无 mock，明确占位，避免误连真实后端
+  if (isDemoActive(req)) {
+    return new Response(
+      JSON.stringify({ error: '演示模式不支持流式接口', code: 'DEMO_NOT_IMPLEMENTED' }),
+      { status: 404, headers: { 'Content-Type': 'application/json; charset=utf-8' } },
+    );
+  }
+
+  const { access } = readPair(req);
+  const headers: Record<string, string> = {};
+  if (opts.jsonBody !== undefined) headers['Content-Type'] = 'application/json';
+  if (access) headers.Authorization = `Bearer ${access}`;
+
+  let upstream: Response;
+  try {
+    upstream = await fetchWithTimeout(`${BACKEND_URL}${API_PREFIX}${opts.path}`, {
+      method: opts.method || 'POST',
+      headers,
+      body: opts.jsonBody !== undefined ? JSON.stringify(opts.jsonBody) : undefined,
+      cache: 'no-store',
+    });
+  } catch {
+    // 后端网络层不可达：标记自动降级并返回 502（流式接口不 mock）
+    markBackendUnreachable();
+    return new Response(
+      JSON.stringify({ error: '后端服务暂不可达', code: 'BACKEND_UNREACHABLE' }),
+      { status: 502, headers: { 'Content-Type': 'application/json; charset=utf-8' } },
+    );
+  }
+
+  return new Response(upstream.body, {
+    status: upstream.status,
+    headers: {
+      'Content-Type': upstream.headers.get('content-type') || 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      'X-Accel-Buffering': 'no',
+    },
+  });
+}
+
+/** 写回 JWT 对（登录成功 / 刷新轮换后调用） */
+export function setAuthCookies(res: NextResponse, pair: BackendTokenPair): void {  res.cookies.set(ACCESS_COOKIE, pair.accessToken, {
+    httpOnly: true,
+    sameSite: 'lax',
+    path: '/',
+    maxAge: ACCESS_MAX_AGE,
+    secure: process.env.NODE_ENV === 'production',
+  });
+  res.cookies.set(REFRESH_COOKIE, pair.refreshToken, {
+    httpOnly: true,
+    sameSite: 'lax',
+    path: '/',
+    maxAge: REFRESH_MAX_AGE,
+    secure: process.env.NODE_ENV === 'production',
+  });
+}
+
+/** 清除 JWT 对（登出 / 刷新失败） */
+export function clearAuthCookies(res: NextResponse): void {
+  // __Host- cookies must retain Secure + Path=/ + no Domain even when deleting.
+  const options = {
+    httpOnly: true,
+    sameSite: 'lax' as const,
+    path: '/',
+    maxAge: 0,
+    secure: process.env.NODE_ENV === 'production',
+  };
+  res.cookies.set(ACCESS_COOKIE, '', options);
+  res.cookies.set(REFRESH_COOKIE, '', options);
+}
+
+/** 把后端错误体规范化为前端 {error, code?} 形状 */
+export function normalizeError(body: unknown, fallback = '请求失败'): { error: string; code?: string } {
+  const b = (typeof body === 'object' && body !== null ? body : {}) as Record<string, unknown>;
+  return {
+    error: typeof b.message === 'string' ? b.message : fallback,
+    code: typeof b.errorCode === 'string' ? b.errorCode : undefined,
+  };
+}
+
+// ---------------------------------------------------------------- 通用 BFF 响应原语（C-15 降重复基石）
+//
+// route.ts 薄转发里反复出现的样板：body 兜底、数组提取、成功/错误响应 + Cookie 接线、
+// 安全读取请求体。集中于此，既削减每文件重复，也为后续 route 骨架生成器提供同源原语。
+
+/** 代理结果 body 兜底为空对象（route 内常做 `proxy.body ?? {}`） */
+export function bodyOrEmpty(proxy: ProxyResult): Record<string, unknown> {
+  return (proxy.body ?? {}) as Record<string, unknown>;
+}
+
+/** 从响应体按 key 取数组，缺失或非数组时返回空数组（route 内常做 Array.isArray 提取） */
+export function arrayFrom(body: Record<string, unknown>, key: string): Array<Record<string, unknown>> {
+  const v = body[key];
+  return Array.isArray(v) ? (v as Array<Record<string, unknown>>) : [];
+}
+
+/** 成功响应：写回轮换后的 JWT（如有 authPair）并返回 JSON 响应 */
+export function okJson(data: unknown, proxy: ProxyResult, init?: ResponseInit): NextResponse {
+  const res = NextResponse.json(data, init);
+  if (proxy.authPair) setAuthCookies(res, proxy.authPair);
+  return res;
+}
+
+/** 错误响应：规范化错误体（normalizeError），刷新失败时清 Cookie；默认沿用 proxy.status */
+export function errJson(proxy: ProxyResult, fallback = '请求失败', init?: ResponseInit): NextResponse {
+  const res = NextResponse.json(normalizeError(proxy.body, fallback), init ?? { status: proxy.status });
+  if (proxy.clearAuth) clearAuthCookies(res);
+  return res;
+}
+
+/** 安全读取请求 JSON 体，解析失败兜底为空对象（route 内常做 req.json().catch(() => ({}))） */
+export async function readJsonBody(req: Request): Promise<Record<string, unknown>> {
+  return (await req.json().catch(() => ({}))) as Record<string, unknown>;
+}
+
+// ---------------------------------------------------------------- 翻译助手
+
+export function toAnnouncement(b: unknown): Record<string, unknown> { const r = b as Record<string, unknown>;
+  return {
+    id: String(r.id),
+    title: r.title,
+    content: r.content ?? null,
+    level: r.level ?? 'info',
+    isActive: r.is_active !== false,
+    isDismissible: r.is_dismissible !== false,
+    priority: r.priority ?? 0,
+    expiresAt: r.expires_at ?? null,
+    targetRoles: r.target_roles ?? null,
+    createdBy: r.created_by != null ? String(r.created_by) : '',
+    createdAt: r.created_at ?? '',
+    updatedAt: r.updated_at ?? '',
+  };
+}
+
+/** 后端 AnnouncementOut（对齐 OpenAPI） */
+export type AnnouncementOutLike = Api['AnnouncementOut'];
+
+export function toNotification(b: unknown): Record<string, unknown> { const r = b as Record<string, unknown>;
+  return {
+    id: String(r.id),
+    userId: String(r.user_id),
+    type: r.type,
+    title: r.title,
+    content: r.content ?? null,
+    isRead: r.is_read === true,
+    senderId: r.sender_id != null ? String(r.sender_id) : null,
+    createdAt: r.created_at ?? '',
+  };
+}
+
+/** 后端 NotificationOut（对齐 OpenAPI） */
+export type NotificationOutLike = Api['NotificationOut'];
+
+export function toJoinApplication(b: unknown): Record<string, unknown> { const r = b as Record<string, unknown>;
+  return {
+    id: String(r.id),
+    applicantName: r.applicant_name,
+    studentId: r.student_id,
+    major: r.major,
+    techTags: Array.isArray(r.tech_tags) ? r.tech_tags : [],
+    reason: r.reason,
+    contactQq: r.contact_qq ?? null,
+    contactPhone: r.contact_phone ?? null,
+    userId: r.user_id != null ? String(r.user_id) : null,
+    status: r.status ?? 'pending',
+    reviewedBy: r.reviewed_by != null ? String(r.reviewed_by) : null,
+    reviewNote: r.review_note ?? null,
+    createdAt: r.created_at ?? '',
+    updatedAt: r.updated_at ?? '',
+  };
+}
+
+/** 后端 JoinApplicationOut（对齐 OpenAPI） */
+export type JoinApplicationOutLike = Api['JoinApplicationOut'];
+
+/** 管理员用户列表：后端分页结构 → 前端契约（pageSize/totalPages + SafeUser + roles） */
+export function toAdminUserList(b: unknown): Record<string, unknown> { const r = b as Record<string, unknown>;
+  const users = (Array.isArray(r.users) ? r.users : []) as Array<
+    BackendUser & { roles?: string[] }
+  >;
+  return {
+    users: users.map((u) => toSafeUserFromBackend(u, u.roles)),
+    total: Number(r.total ?? 0),
+    page: Number(r.page ?? 1),
+    pageSize: Number(r.pageSize ?? 50),
+    totalPages: Number(r.totalPages ?? 1),
+  };
+}
+
+/**
+ * 前端权限 key（module.resource.action）→ 后端权限名（resource:action）。
+ * 例：community.topic.hide → community_topic:hide
+ */
+export function frontendKeyToBackendName(key: string): string {
+  const parts = key.split('.');
+  if (parts.length < 2) return key;
+  const action = parts.pop()!;
+  return `${parts.join('_')}:${action}`;
+}
+
+/** 后端权限名（resource:action）→ 前端权限 key（module.resource.action）。 */
+export function backendNameToFrontendKey(name: string): string {
+  const idx = name.lastIndexOf(':');
+  if (idx === -1) return name;
+  return `${name.slice(0, idx).replace(/_/g, '.')}.${name.slice(idx + 1)}`;
+}
+
+/** 后端 AdminRoleOut（对齐 OpenAPI） */
+export type AdminRoleLike = Api['AdminRoleOut'];
+
+/** 后端 AdminRoleOut → 前端 RoleRecord（权限名映射回前端 key，仅保留已知权限点） */
+export function toAdminRole(b: unknown, knownKeys: Set<string> = new Set()): Record<string, unknown> { const r = b as Record<string, unknown>;
+  const permissions = ((r.permissions ?? []) as unknown[])
+    .map(backendNameToFrontendKey as (name: unknown) => string)
+    .filter((k: string) => knownKeys.has(k));
+  return {
+    key: r.name,
+    displayName: r.display_name || r.name,
+    description: r.description ?? '',
+    isSystem: r.is_system === true,
+    isProtected: r.is_protected === true || r.is_system === true,
+    sortOrder: r.sort_order ?? 0,
+    permissions,
+    userCount: r.user_count ?? 0,
+    createdAt: r.created_at ?? '',
+    updatedAt: r.updated_at ?? '',
+  };
+}
+
+/** 后端 AuditLogItem（对齐 OpenAPI） */
+export type AuditLogLike = Api['AuditLogItem'];
+
+/** 后端 AuditLogItem → 前端 AdminAction */
+export function toAdminAction(b: unknown): Record<string, unknown> { const r = b as Record<string, unknown>;
+  // 后端审计 detail 里可能携带被操作资源的身份信息（email/username/名称），
+  // 用于前端展示"被操作的用户/资源"；无则回落到 resource_id / resource_type。
+  let detailObj: Record<string, unknown> | null = null;
+  if (r.detail && typeof r.detail === 'object') {
+    detailObj = r.detail as Record<string, unknown>;
+  }
+  const targetEmail =
+    (detailObj && (detailObj.email as string | undefined)) ??
+    (detailObj && (detailObj.target_email as string | undefined)) ??
+    null;
+  const targetName =
+    (detailObj && (detailObj.username as string | undefined)) ??
+    (detailObj && (detailObj.display_name as string | undefined)) ??
+    (detailObj && (detailObj.name as string | undefined)) ??
+    null;
+  return {
+    id: String(r.id),
+    adminId: r.actor_id != null ? String(r.actor_id) : null,
+    adminEmail: r.actor_username ?? null,
+    adminDisplayName: r.actor_username ?? null,
+    action: r.action,
+    resourceType: r.resource_type ?? null,
+    resourceId: r.resource_id != null ? String(r.resource_id) : null,
+    targetUserId: r.resource_type === 'user' && r.resource_id ? String(r.resource_id) : null,
+    targetEmail: targetEmail ?? null,
+    targetDisplayName: targetName ?? null,
+    details: r.detail ? JSON.stringify(r.detail) : null,
+    ip: r.ip_address ?? null,
+    userAgent: r.user_agent ?? null,
+    createdAt: r.created_at ?? '',
+  };
+}
+
+/** 后端 EventOut（对齐 OpenAPI） */
+export type EventOutLike = Api['EventOut'];
+
+/** 后端 EventOut → 前端 EventItem */
+export function toEventItem(b: unknown): Record<string, unknown> { const r = b as Record<string, unknown>;
+  const status = typeof r.status === 'string' ? r.status : '';
+  return {
+    id: String(r.id),
+    month: r.month ?? null,
+    date: r.date ?? null,
+    title: r.title,
+    description: r.description ?? null,
+    status: ['upcoming', 'ongoing', 'ended'].includes(status) ? status : null,
+    year: r.year ?? null,
+    topics: Array.isArray(r.topics) ? r.topics : [],
+    tags: Array.isArray(r.tags) ? r.tags : [],
+    isPinned: r.is_pinned === true,
+    capacity: r.capacity ?? 0,
+    contentMarkdown: r.content_markdown ?? null,
+    registrationFields: Array.isArray(r.registration_fields) ? r.registration_fields : [],
+    createdBy: r.created_by != null ? String(r.created_by) : null,
+    createdAt: r.created_at ?? '',
+    updatedAt: r.updated_at ?? '',
+    ...(r.registered_count != null ? { registeredCount: r.registered_count } : {}),
+  };
+}
+
+/** 后端 EventRegistrationOut（对齐 OpenAPI） */
+export type EventRegistrationOutLike = Api['EventRegistrationOut'];
+
+/** 后端 EventRegistrationOut → 前端 EventRegistration */
+export function toEventRegistration(b: unknown): Record<string, unknown> { const r = b as Record<string, unknown>;
+  const status = typeof r.status === 'string' ? r.status : '';
+  return {
+    id: String(r.id),
+    userId: String(r.user_id),
+    eventId: String(r.event_id),
+    status: ['registered', 'cancelled', 'waitlisted'].includes(status) ? status : 'registered',
+    formData: r.form_data ?? null,
+    registeredAt: r.registered_at ?? '',
+    cancelledAt: r.cancelled_at ?? null,
+  };
+}
+
+/** 后端 EventCheckinOut → 前端 EventCheckin */
+export function toEventCheckin(b: unknown): Record<string, unknown> { const r = b as Record<string, unknown>;
+  return {
+    id: String(r.id),
+    eventId: String(r.event_id),
+    registrationId: r.registration_id != null ? String(r.registration_id) : null,
+    userId: r.user_id != null ? String(r.user_id) : null,
+    checkinCode: r.checkin_code,
+    checkedInAt: r.checked_in_at ?? null,
+    checkedInBy: r.checked_in_by != null ? String(r.checked_in_by) : null,
+    createdAt: r.created_at ?? '',
+  };
+}
+
+/** 后端 CategoryOut → 前端 CommunityCategory */
+export function toCommunityCategory(b: unknown): Record<string, unknown> { const r = b as Record<string, unknown>;
+  return {
+    id: String(r.id),
+    slug: r.slug,
+    name: r.name,
+    description: r.description ?? null,
+    icon: r.icon ?? null,
+    sortOrder: Number(r.sort_order ?? 0),
+    topicCount: Number(r.post_count ?? 0),
+    postCount: Number(r.post_count ?? 0),
+    createdBy: r.created_by != null ? String(r.created_by) : null,
+    createdAt: r.created_at ?? '',
+    updatedAt: r.updated_at ?? '',
+  };
+}
+
+/** 后端 CommunityPost（统一 topic|post）→ 前端帖子对象 */
+export function toCommunityPost(b: unknown): Record<string, unknown> { const r = b as Record<string, unknown>;
+  return {
+    id: String(r.id),
+    kind: r.kind ?? 'topic',
+    categoryId: r.category_id != null ? String(r.category_id) : null,
+    authorId: String(r.author_id),
+    title: r.title,
+    contentMarkdown: r.content_markdown,
+    status: ['hidden', 'deleted', 'draft', 'archived'].includes(String(r.status))
+      ? r.status
+      : 'published',
+    isPinned: r.is_pinned === true,
+    isFeatured: r.is_featured === true,
+    replyCount: Number(r.reply_count ?? 0),
+    favoriteCount: Number(r.favorite_count ?? 0),
+    lastReplyAt: r.last_reply_at ?? null,
+    lastReplyId: r.last_reply_id != null ? String(r.last_reply_id) : null,
+    hiddenBy: r.hidden_by != null ? String(r.hidden_by) : null,
+    hiddenAt: r.hidden_at ?? null,
+    hiddenReason: r.hidden_reason ?? null,
+    slug: r.slug ?? null,
+    excerpt: r.excerpt ?? null,
+    coverImage: r.cover_image ?? null,
+    tags: Array.isArray(r.tags) ? r.tags : [],
+    seriesId: r.series_id != null ? String(r.series_id) : null,
+    seriesOrder: r.series_order ?? 0,
+    publishedAt: r.published_at ?? null,
+    viewCount: Number(r.view_count ?? 0),
+    likeCount: Number(r.like_count ?? 0),
+    author: r.author ?? null,
+    category: r.category ?? null,
+    isLikedByMe: r.is_liked_by_me === true,
+    isFavoritedByMe: r.is_favorited_by_me === true,
+    createdAt: r.created_at ?? '',
+    updatedAt: r.updated_at ?? '',
+  };
+}
+
+/** 后端 CommunityComment → 前端评论对象 */
+export function toCommunityComment(b: unknown): Record<string, unknown> { const r = b as Record<string, unknown>;
+  return {
+    id: String(r.id),
+    postId: String(r.post_id),
+    authorId: String(r.author_id),
+    parentCommentId: r.parent_comment_id != null ? String(r.parent_comment_id) : null,
+    contentMarkdown: r.content_markdown,
+    status: ['hidden', 'deleted'].includes(String(r.status)) ? r.status : 'published',
+    likeCount: Number(r.like_count ?? 0),
+    replyCount: Number(r.reply_count ?? 0),
+    hiddenBy: r.hidden_by != null ? String(r.hidden_by) : null,
+    hiddenAt: r.hidden_at ?? null,
+    hiddenReason: r.hidden_reason ?? null,
+    author: r.author ?? null,
+    createdAt: r.created_at ?? '',
+    updatedAt: r.updated_at ?? '',
+  };
+}
+
+// ---------------------------------------------------------------- 任务代理（旧项目单接取人模型）
+
+/**
+ * 后端任务代理契约（对齐 legacy_task_client.map_task，snake_case）→ 官网前端 TaskData。
+ * 任务唯一事实源是旧项目；官网不落库，仅做字段名与状态码翻译。
+ */
+export function toTask(b: unknown): Record<string, unknown> {
+  const r = (b ?? {}) as Record<string, unknown>;
+  const c = r.completer as Record<string, unknown> | null | undefined;
+  return {
+    id: String(r.id),
+    title: r.title ?? '',
+    description: r.description ?? null,
+    difficulty: r.difficulty ?? null,
+    techRequirements: Array.isArray(r.tech_requirements) ? r.tech_requirements : [],
+    reward: Number(r.reward ?? 0),
+    deadline: r.deadline ?? null,
+    status: r.status ?? '',
+    // 旧项目原始中文状态：只读展示与排障用（状态码未知时前端回落到它）。
+    statusLabel: r.status_label ?? null,
+    publisherId: r.publisher_id != null ? String(r.publisher_id) : null,
+    publisherName: r.publisher_name ?? null,
+    publisherAvatar: r.publisher_avatar ?? null,
+    completer: c
+      ? {
+          id: c.id != null ? String(c.id) : '',
+          name: c.name ?? null,
+          avatar: c.avatar ?? null,
+        }
+      : null,
+    submissionDescription: r.submission_description ?? null,
+    attachmentUrl: r.attachment_url ?? null,
+    rejectReason: r.reject_reason ?? null,
+    reviewedBy: r.reviewed_by ?? null,
+    reviewedAt: r.reviewed_at ?? null,
+    createdAt: r.created_at ?? '',
+    updatedAt: r.updated_at ?? '',
+  };
+}
+
+/** 后端任务代理契约 → 官网前端 ClaimData（官网无 claim_id，以 task_id 为键合成）。 */
+export function toClaim(b: unknown): Record<string, unknown> {
+  const r = (b ?? {}) as Record<string, unknown>;
+  return {
+    id: String(r.id),
+    taskId: String(r.task_id ?? r.id),
+    userId: r.user_id != null ? String(r.user_id) : null,
+    status: r.status ?? '',
+    statusLabel: r.status_label ?? null,
+    createdAt: r.created_at ?? '',
+    task: r.task ? toTask(r.task) : null,
+  };
+}
+
+/** 后端 MemberOut → 前端 MemberItem */
+export function toMember(b: unknown): Record<string, unknown> { const r = b as Record<string, unknown>;
+  return {
+    id: String(r.id),
+    displayName: r.display_name ?? null,
+    bio: r.bio ?? null,
+    avatarUrl: r.avatar_url ?? null,
+    avatarType: r.avatar_type ?? 'initial',
+    githubUrl: r.github_url ?? null,
+    websiteUrl: r.website_url ?? null,
+    techTags: Array.isArray(r.tech_tags) ? r.tech_tags : [],
+    role: r.role ?? 'user',
+    joinedAt: r.joined_at ?? '',
+  };
+}

@@ -1,0 +1,317 @@
+/**
+ * @file 工具集入口页（/tools）— 工作台 + 工具入口收编
+ * 顶部为个人工作台（问候条/今日任务/番茄钟×播放器/倒计时/便签），
+ * 底部保留原工具入口网格（可用/开发中/管理）。
+ */
+
+'use client';
+
+import Link from 'next/link';
+import { Badge, GhostTitle, Title } from '@/components';
+import { Bot, BookOpen, ClipboardList, Code2, GraduationCap, MessageCircle, MessageSquare } from 'lucide-react';
+import { RevealTitle, RevealItem } from '@/components/effects/motion-primitives';
+import { type CapsuleTab } from '@/components/layout/floating-capsule-sidebar';
+import { CollapsingHero, type HeroState } from '@/components/layout/collapsing-hero';
+import { AdminToolsPanel } from '@/modules/tools/ui/admin-tools-panel';
+import { Workbench } from '@/modules/workbench/workbench';
+import { VisibilityGate } from '@/shared/feature-visibility/visibility-gate';
+import { useCollapsingHero } from '@/shared/hooks/use-collapsing-hero';
+import { useTranslations } from 'next-intl';
+import type { SafeUser } from '@/modules/admin/ui/types';
+import { useEffect, useMemo, useState } from 'react';
+import { apiRequest } from '@/shared/hooks/use-api-request';
+
+type ToolTab = 'available' | 'developing' | 'admin';
+
+interface ToolCard {
+  href: string;
+  icon: React.ReactNode;
+  titleKey: string;
+  enKey: string;
+  descKey: string;
+  status: ToolTab;
+  /** 受管组件 key（与可见性注册表一致） */
+  visibilityKey: string;
+}
+
+const TOOLS: ToolCard[] = [
+  {
+    href: '/tools/auxilio',
+    icon: <Bot className="w-5 h-5" />,
+    titleKey: 'auxilioAgentTitle',
+    enKey: 'auxilioAgentEn',
+    descKey: 'auxilioAgentDesc',
+    status: 'available',
+    visibilityKey: 'tools-auxilio',
+  },
+  {
+    href: '/tools/exam',
+    icon: <GraduationCap className="w-5 h-5" />,
+    titleKey: 'examTitle',
+    enKey: 'examEn',
+    descKey: 'examDesc',
+    status: 'available',
+    visibilityKey: 'tools-exam',
+  },
+  {
+    href: '/tools/resource',
+    icon: <BookOpen className="w-5 h-5" />,
+    titleKey: 'resourceTitle',
+    enKey: 'resourceEn',
+    descKey: 'resourceDesc',
+    status: 'available',
+    visibilityKey: 'tools-resource',
+  },
+  {
+    href: '/tools/task',
+    icon: <ClipboardList className="w-5 h-5" />,
+    titleKey: 'taskTitle',
+    enKey: 'taskEn',
+    descKey: 'taskDesc',
+    status: 'available',
+    visibilityKey: 'tools-task',
+  },
+  {
+    href: '/tools/dev-center',
+    icon: <Code2 className="w-5 h-5" />,
+    titleKey: 'devCenterTitle',
+    enKey: 'devCenterEn',
+    descKey: 'devCenterDesc',
+    status: 'available',
+    visibilityKey: 'tools-dev-center',
+  },
+  {
+    href: '/community',
+    icon: <MessageSquare className="w-5 h-5" />,
+    titleKey: 'communityTitle',
+    enKey: 'communityEn',
+    descKey: 'communityDesc',
+    status: 'available',
+    visibilityKey: 'community',
+  },
+  {
+    href: '',
+    icon: <MessageCircle className="w-5 h-5" />,
+    titleKey: 'chatTitle',
+    enKey: 'chatEn',
+    descKey: 'chatDesc',
+    status: 'developing',
+    visibilityKey: 'tools-chat',
+  },
+];
+
+/** 状态翻译 key（组件内解析） */
+function statusLabelKey(status: ToolTab): string {
+  switch (status) {
+    case 'available':
+      return 'statusAvailable';
+    case 'developing':
+      return 'statusDeveloping';
+    default:
+      return '';
+  }
+}
+
+export default function ToolsPage() {
+  const t = useTranslations('tools');
+  const wt = useTranslations('workbench');
+  const {
+    collapsed: heroCollapsed,
+    capsuleVisible,
+    onRevealComplete,
+    onTitleClick,
+  } = useCollapsingHero();
+
+  const hero: HeroState = {
+    collapsed: heroCollapsed,
+    capsuleVisible,
+    onRevealComplete,
+    onTitleClick,
+  };
+
+  const [currentUser, setCurrentUser] = useState<SafeUser | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiRequest<{ user: SafeUser }>('/api/auth/me', { cache: 'no-store' })
+      .then((r) => {
+        if (r.status === 401) return null;
+        if (!r.ok) return null;
+        return r.data;
+      })
+      .then((data) => {
+        if (cancelled || !data) return;
+        const user = data.user;
+        if ((user.role === 'admin' || user.role === 'root') && user.isActive) {
+          setCurrentUser(user);
+        }
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  const isAdmin = currentUser !== null;
+
+  const [activeTab, setActiveTab] = useState('available' as ToolTab);
+
+  const toolsTabs: CapsuleTab[] = useMemo(
+    () => [
+      { key: 'available', num: '01', label: t('tabAvailable') },
+      { key: 'developing', num: '02', label: t('tabDeveloping') },
+      ...(isAdmin ? [{ key: 'admin', num: '99', label: t('tabAdmin') }] : []),
+    ],
+    [isAdmin, t],
+  );
+
+  const filteredTools = useMemo(
+    () => TOOLS.filter((t) => t.status === activeTab),
+    [activeTab],
+  );
+
+  return (
+    <VisibilityGate componentKey="tools">
+      <main className="relative pt-16 pixel-page">
+      {/* ============ [ 00 ] Hero ============ */}
+      <CollapsingHero
+        index="00"
+        label={wt('wbTitle')}
+        hero={hero}
+        pageKey="tools"
+        minHeight="50vh"
+        capsule={{
+          tabs: toolsTabs,
+          activeKey: activeTab,
+          onTabChange: (key) => setActiveTab(key as ToolTab),
+        }}
+      >
+        <RevealTitle>
+          <Title
+            level={1}
+            collapsed={hero.collapsed}
+            collapsedSize="cursor-pointer text-[clamp(22px,4vw,36px)] leading-[1.2]"
+            expandedSize="text-[clamp(36px,9vw,120px)] leading-[1.05] sm:leading-[0.95]"
+            echo={`${wt('wbTitle')}`}
+            subtitle={wt('wbSubtitle')}
+            onClick={hero.collapsed ? hero.onTitleClick : undefined}
+          >
+            {wt('wbTitle')}
+          </Title>
+        </RevealTitle>
+        <RevealItem>
+          <div
+            className={`overflow-hidden transition-all hero-reveal ${
+              hero.collapsed
+                ? 'max-h-[14px] opacity-30 mt-1'
+                : 'max-h-[200px] opacity-100 mt-8 sm:mt-12'
+            }`}
+          >
+            <p
+              className={`max-w-2xl text-[var(--muted-foreground)] leading-[1.8] line-clamp-1 transition-all hero-reveal ${
+                hero.collapsed ? 'text-[9px]' : 'text-[15px] sm:text-[16px]'
+              }`}
+            >
+              {t('heroDesc1')}
+              <span className="serif-italic text-[var(--foreground)]">
+                {t('heroDesc2')}
+              </span>
+              。
+            </p>
+          </div>
+        </RevealItem>
+      </CollapsingHero>
+
+      {/* ============ [ 01 ] 工作台 ============ */}
+      <Workbench />
+      <section data-section-nav="01|工具列表" className="px-4 sm:px-6 md:px-8 py-16 sm:py-24 border-t border-[var(--border)]">
+        <div className="max-w-[1600px] mx-auto w-full md:pl-[72px] lg:pl-[88px]">
+          <div>
+            <Title level={2} className="mb-4"
+              echo={`${activeTab === 'available' ? wt('allTools') : t('sectionTitleDeveloping')}`}>
+              {activeTab === 'available' && wt('allTools')}
+              {activeTab === 'developing' && t('sectionTitleDeveloping')}
+            </Title>
+            <p className="meta-mono normal-case tracking-normal text-[var(--muted-foreground)] text-[13px] mb-10 sm:mb-16">
+              {activeTab === 'available' && wt('toolsHint')}
+              {activeTab === 'developing' && t('sectionDescDeveloping')}
+            </p>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {filteredTools.map((tool) => {
+                const isAvailable = tool.status === 'available';
+
+                const CardContent = (
+                  <div
+                    className={`dna-card ${
+                      isAvailable
+                        ? 'cursor-pointer hover:bg-[var(--primary)]/[0.03]'
+                        : 'opacity-40 cursor-default'
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-4 mb-4">
+                      <div className="text-[var(--primary)]">{tool.icon}</div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <Badge variant={
+                          tool.status === 'available'
+                            ? 'success'
+                            : tool.status === 'developing'
+                              ? 'amber'
+                              : 'muted'
+                        }>
+                          {t(statusLabelKey(tool.status) as Parameters<typeof t>[0])}
+                        </Badge>
+                      </div>
+                    </div>
+
+                    <h3 className="display-serif text-[18px] sm:text-[20px] text-[var(--foreground)] mb-1">
+                      {t(tool.titleKey as Parameters<typeof t>[0])}
+                    </h3>
+                    <p className="meta-mono text-[10px] sm:text-[11px] text-[var(--muted-foreground)] mb-3 uppercase tracking-wider">
+                      {t(tool.enKey as Parameters<typeof t>[0])}
+                    </p>
+
+                    <p className="text-[13px] sm:text-[14px] text-[var(--muted-foreground)] leading-[1.7]">
+                      {t(tool.descKey as Parameters<typeof t>[0])}
+                    </p>
+
+                    {isAvailable && (
+                      <div className="mt-5 text-[var(--primary)] meta-mono text-[12px] group-hover:translate-x-1 transition-transform">
+                        {t('enter')}
+                      </div>
+                    )}
+                  </div>
+                );
+
+                if (isAvailable) {
+                  return (
+                    <VisibilityGate key={tool.titleKey} componentKey={tool.visibilityKey}>
+                      <Link href={tool.href}>
+                        {CardContent}
+                      </Link>
+                    </VisibilityGate>
+                  );
+                }
+                return (
+                  <VisibilityGate key={tool.titleKey} componentKey={tool.visibilityKey}>
+                    <div>{CardContent}</div>
+                  </VisibilityGate>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* Tab 99 — 工具管理（仅管理员） */}
+      {activeTab === 'admin' && currentUser && (
+        <VisibilityGate componentKey="tools-admin-panel">
+          <section className="px-4 sm:px-6 md:px-8 py-16 sm:py-24 border-t border-[var(--border)]">
+            <div className="max-w-[1600px] mx-auto w-full md:pl-[72px] lg:pl-[88px]">
+              <AdminToolsPanel />
+            </div>
+          </section>
+        </VisibilityGate>
+      )}
+    </main>
+    </VisibilityGate>
+  );
+}

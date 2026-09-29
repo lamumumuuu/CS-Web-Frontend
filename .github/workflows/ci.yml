@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  # 手动触发：用于按需跑 Type Check + Lint + Test + Build + Audit
+  # E2E 已迁移至根仓 .github/workflows/e2e.yml（需全栈环境）
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Type Check + Lint + Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 9.0.0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Type Check
+        run: pnpm run ts-check
+
+      - name: API types drift gate (ER-47)
+        # 消费者契约：后端 OpenAPI baseline 变更而未重新生成前端类型 → CI 红
+        # （生成文件已提交入库；基线更新须 pnpm gen:api-types 同步）。
+        run: |
+          pnpm run gen:api-types
+          git diff --exit-code -- src/shared/api/backend-api.d.ts
+
+      - name: Lint
+        run: pnpm run lint:build
+
+      - name: BFF security boundary (AL-1)
+        # 边界硬约束：'use client' 文件禁止从 @/shared/security（非 schemas 子树）导入
+        # 密码哈希/权限判定/JWT 签发等权威安全逻辑（后端为认证/授权唯一权威）。
+        run: pnpm run check:bff-boundary
+
+      - name: Test (with coverage gate)
+        # ER-13：跑覆盖率并执行 thresholds 门禁（基线地板，防下滑），低于阈值则 CI 失败
+        run: pnpm test:coverage
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+
+      - name: Diff coverage gate (ER-13)
+        # PR 级新增代码覆盖率门禁：新增 src/** 代码覆盖率 < 80% 则 CI 失败
+        if: github.event_name == 'pull_request'
+        run: |
+          # 补齐 HEAD 与 base 完整历史，避免「浅克隆 + base 长期落后」导致 no merge base
+          git fetch origin --unshallow || true
+          git fetch origin ${{ github.base_ref }}
+          # 一次性大 PR(如把长期落后的 base 拉到当前)改动文件过多时 diff 量测失真，
+          # 跳过本门禁；常规小 PR 仍严格生效。
+          CHANGED=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" 2>/dev/null | wc -l | tr -d ' ')
+          echo "changed files: $CHANGED"
+          if [ "${CHANGED:-0}" -gt 100 ]; then
+            echo "::notice::large PR(scoped migration), skipping diff-coverage gate"
+            exit 0
+          fi
+          node tools/scripts/check/diff-coverage.mjs --base origin/${{ github.base_ref }} --threshold 80
+
+  build:
+    name: Build Verification
+    runs-on: ubuntu-latest
+    needs: validate
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 9.0.0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm run build
+        env:
+          # 构建所需最小环境变量（占位值，不用于运行）
+          AUTH_SESSION_SECRET: ci-build-placeholder-secret-32bytes-minimum
+          NEXT_PUBLIC_SITE_URL: http://localhost:2333
+          ALLOWED_ORIGINS: http://localhost:2333
+          PASSWORD_RESET_DEFAULT: CI_BUILD_PLACEHOLDER
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v5
+        if: success()
+        with:
+          name: build-output
+          path: .next/
+          retention-days: 3
+
+  security-audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    needs: validate
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 9.0.0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Audit (production deps, blocking on moderate+)
+        # 显式指定官方 registry：.npmrc 的 npmmirror 无审计端点，否则 job 会以
+        # ERR_PNPM_AUDIT_ENDPOINT_NOT_EXISTS 失败（而非真实漏洞检出）。
+        run: pnpm audit --prod --audit-level=moderate --registry https://registry.npmjs.org/
+        # 1.0 GA 门禁（G1）：中危及以上漏洞强制阻断发布，杜绝"带洞上线"。
+        # 误报可用 `pnpm audit` 给出的豁免方式处理；不应再通过 continue-on-error 放行。
+
+      - name: Audit summary
+        if: always()
+        run: |
+          echo "## Dependency Audit" >> $GITHUB_STEP_SUMMARY
+          echo "生产依赖审计（moderate+ 阻断）。出现中危以上漏洞时 CI 已失败，须修复或经团队评审豁免后方可合并。" >> $GITHUB_STEP_SUMMARY
+
+  # E2E 已迁移至根仓 .github/workflows/e2e.yml（ER-14 方案C）。
+  # E2E 需前端+后端+DB 全栈，前端子仓 CI 无法独立起后端；全量 E2E
+  # （nightly cron + workflow_dispatch）改在根仓经 docker-compose 起全栈后运行，
+  # 不进常规 PR。本地手跑仍可用：pnpm test:e2e（需先起后端+DB）。

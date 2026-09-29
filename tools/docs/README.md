@@ -1,0 +1,37 @@
+# FZTBUCS-前端工具文档索引（tools/docs）
+
+> 最后更新：2026-08-07｜类型：index / map
+> 更新人：3yearsZ
+> 受众：前端贡献者 / reviewer / oncall
+> Source of truth：本目录（`CS-Web-Frontend/tools/docs/`）下所有前端工程文档的**统一入口与命名约束**唯一权威位置。
+> 关联：全栈部署/编排见根 [docs/RootDoc-Deploy.md](../../../docs/RootDoc-Deploy.md)；工程规则见根级 [docs/Onboarding.md](../../../docs/Onboarding.md#附录-a前端工程规则)；后端文档入口见 `CS-Web-Backend/tools/docs/`
+> 变更触发：新增/重命名/废弃本目录下任一文档时，须同步更新本索引。
+> Stale 信号：本索引列出的文件不存在 / 存在未列出的 `.md` / 文档"类型"标签与实际不符。
+
+## 命名约束
+
+- 文件名固定前缀 `FrontDoc-`，后缀用 `-<主题>` 表意（如 `-Ops`、`-Sec`、`-Arch`）。
+- 每个文档头部须含"最后更新 / 更新人 / 类型 / Source of truth / 关联 / 变更触发 / Stale 信号"八项元信息（参考现有文档）。
+- 通用规范（跨仓库）以根级 `docs/RootDoc-*` 为准，本文档**不重复**，仅以链接引用（避免分叉）。
+- 后端职责（PG 备份、Alembic、Litestream、后端运维端点等）不在此目录展开，指向 `CS-Web-Backend/tools/docs/`。
+
+## 文档清单
+
+| 文件 | 主题 | 类型 | 说明 |
+|------|------|------|------|
+| [FrontDoc-01-Arch.md](FrontDoc-01-Arch.md) | 架构 + 业务模块契约 | reference | 前端 BFF 架构（Part A）+ 业务模块契约与前后端联动（Part B，统一模板：概述/接口/配置/安全要点/测试/联动） |
+| [RootDoc-ADR.md](../../../docs/RootDoc-ADR.md) | 演进 / ADR | reference + decision | 重大架构决策记录与演进史（设计决策 SSOT，L0） |
+| [FrontDoc-Ops.md](FrontDoc-Ops.md) | 运维 / SLO | reference + how-to | BFF 部署、SLO 阈值、回滚 Runbook |
+| [FrontDoc-03-Conv.md](FrontDoc-03-Conv.md) | 前端编码规范 | reference | TS/React/Next.js 约定、React Compiler 红线、样式令牌、JSDoc、组件复用契约、widget 注册表、**§9 i18n 约定**（含标准迁移流程，2026-08-20 并入原 i18n 文档）、测试、Git、编码侧禁止项（对标后端 BackDoc-03-Conv.md） |
+| [FrontDoc-02-Sec.md](FrontDoc-02-Sec.md) | 安全 | reference | 前端安全约束、CSP、Origin 校验 |
+| [FrontDoc-UID.md](FrontDoc-UID.md) | UI 设计规范 + 组件用法统一契约 | reference | 颜色/字体/布局/组件/动效/交互规范 + 全局组件体系（§5.0）；**§16 组件用法统一契约（SSOT）**（按钮/输入框/徽章/Tab/分页/Modal/z-index 选型/禁止/质量门禁，2026-08-20 并入原 UIButton/UIStandard）；**§4.8 各页面胶囊 Tab 配置 + §4.8.1 设计决策**（2026-08-20 并入原 capsule-tabs）；编码规范已迁出至 FrontDoc-03-Conv.md；Markdown 编辑器契约已下沉至 Arch §2.5.7 |
+| [FrontDoc-Workbench-ReviewPrompt.md](FrontDoc-Workbench-ReviewPrompt.md) | 工作台代码审查 prompt | how-to + work | 工作台（Workbench）全链路代码审查请求优化版模板（前端 React/BFF + 后端 FastAPI 检查点、输出格式、优先级约定）；2026-08-20 由根 `docs/` 移入 |
+
+> PG 迁移归档已于 2026-08-09 归入根 `docs/RootDoc-MigEval.md` §八。
+
+## 如何新增文档
+
+1. 以 `FrontDoc-<主题>.md` 命名，放本目录。
+2. 复制任一现有文档头部八项元信息并填空。
+3. 在本索引"文档清单"追加一行。
+4. 若内容涉及跨仓库通用规范，改为链根级 `RootDoc-*` / 后端 `BackDoc-*`，不要在此复制。
