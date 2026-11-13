@@ -1,5 +1,5 @@
 /**
- * @file BFF → FastAPI 后端代理客户端（前后端分离迁移）
+ * @file BFF → FastAPI 后端代理客户端
  *
  * 职责（OQ-3：JWT 由 BFF HttpOnly Cookie 托管）：
  *   - 从 HttpOnly Cookie 读取 JWT 对（access / refresh），转发时注入 Authorization 头
@@ -408,6 +408,38 @@ export function bodyOrEmpty(proxy: ProxyResult): Record<string, unknown> {
   return (proxy.body ?? {}) as Record<string, unknown>;
 }
 
+/** snake_case → camelCase（仅用于 BFF 传输边界） */
+export function toCamelKey(key: string): string {
+  return key.replace(/_([a-z0-9])/g, (_, ch: string) => ch.toUpperCase());
+}
+
+/** camelCase → snake_case（仅用于 BFF 传输边界） */
+export function toSnakeKey(key: string): string {
+  return key.replace(/[A-Z]/g, (ch) => `_${ch.toLowerCase()}`);
+}
+
+/** 递归转换响应键名；数组与嵌套对象一并处理。 */
+export function camelizeDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => camelizeDeep(item));
+  if (value && typeof value === 'object' && !(value instanceof Date)) {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([k, v]) => [toCamelKey(k), camelizeDeep(v)]),
+    );
+  }
+  return value;
+}
+
+/** 递归转换入参键名；用于浏览器 camelCase → 后端 snake_case。 */
+export function snakeizeDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => snakeizeDeep(item));
+  if (value && typeof value === 'object' && !(value instanceof Date)) {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([k, v]) => [toSnakeKey(k), snakeizeDeep(v)]),
+    );
+  }
+  return value;
+}
+
 /** 从响应体按 key 取数组，缺失或非数组时返回空数组（route 内常做 Array.isArray 提取） */
 export function arrayFrom(body: Record<string, unknown>, key: string): Array<Record<string, unknown>> {
   const v = body[key];
@@ -528,22 +560,26 @@ export function backendNameToFrontendKey(name: string): string {
 /** 后端 AdminRoleOut（对齐 OpenAPI） */
 export type AdminRoleLike = Api['AdminRoleOut'];
 
-/** 后端 AdminRoleOut → 前端 RoleRecord（权限名映射回前端 key，仅保留已知权限点） */
-export function toAdminRole(b: unknown, knownKeys: Set<string> = new Set()): Record<string, unknown> { const r = b as Record<string, unknown>;
-  const permissions = ((r.permissions ?? []) as unknown[])
-    .map(backendNameToFrontendKey as (name: unknown) => string)
-    .filter((k: string) => knownKeys.has(k));
+/** 后端 AdminRoleOut → 前端 RoleRecord（权限名映射回前端 key；传入 knownKeys 时才做白名单过滤） */
+export function toAdminRole(b: unknown, knownKeys?: Set<string>): Record<string, unknown> { const r = b as Record<string, unknown>;
+  const filter = knownKeys && knownKeys.size > 0 ? knownKeys : null;
+  const permissions = ((r.permissions ?? []) as string[])
+    .map((name) => backendNameToFrontendKey(name))
+    .filter((key) => (filter ? filter.has(key) : true));
   return {
-    key: r.name,
-    displayName: r.display_name || r.name,
-    description: r.description ?? '',
-    isSystem: r.is_system === true,
-    isProtected: r.is_protected === true || r.is_system === true,
-    sortOrder: r.sort_order ?? 0,
+    id: r.id,
+    key: String(r.name ?? ''),
+    // 后端 AdminRoleOut 继承 TZModel，JSON 契约统一 camelCase
+    displayName: (r.displayName as string) || String(r.name ?? ''),
+    fantasyDisplayName: (r.fantasyDisplayName as string) ?? '',
+    description: (r.description as string) ?? '',
+    isSystem: r.isSystem === true,
+    isProtected: r.isProtected === true,
+    sortOrder: Number(r.sortOrder ?? 0),
     permissions,
-    userCount: r.user_count ?? 0,
-    createdAt: r.created_at ?? '',
-    updatedAt: r.updated_at ?? '',
+    userCount: Number(r.userCount ?? 0),
+    createdAt: (r.createdAt as string) ?? '',
+    updatedAt: (r.updatedAt as string) ?? '',
   };
 }
 

@@ -44,7 +44,26 @@ export interface ToolsMessages {
   toolsTask: {
     tabBoard: string;
     tabMyClaims: string;
+    tabTeams: string;
     tabPoints: string;
+    teamCreate: string;
+    teamName: string;
+    teamInviteeHint: string;
+    teamCreateAction: string;
+    teamInvitations: string;
+    teamNoInvitations: string;
+    teamInvitedBy: string;
+    teamId: string;
+    teamAccept: string;
+    teamReject: string;
+    teamEmpty: string;
+    teamCaptain: string;
+    teamMembers: string;
+    teamInvite: string;
+    teamLeave: string;
+    teamUserId: string;
+    teamLeaderPays: string;
+    teamLoading: string;
     heroLabel: string;
     heroTitle1: string;
     heroTitle2: string;
@@ -143,6 +162,16 @@ export interface ToolsMessages {
     submitting: string;
     submit: string;
     rejectReasonPrompt: string;
+    transferTitle: string;
+    transferRecipientHint: string;
+    transferSearch: string;
+    transferAmount: string;
+    transferRemark: string;
+    transferAction: string;
+    transferSuccess: string;
+    transferNoRecipient: string;
+    entriesTitle: string;
+    entriesEmpty: string;
   },
   toolsDevCenter: {
     heroLabel: string;
@@ -580,7 +609,26 @@ export const zhCN: ToolsMessages = {
   toolsTask: {
     tabBoard: '任务板',
     tabMyClaims: '我的认领',
+    tabTeams: '我的队伍',
     tabPoints: '积分',
+    teamCreate: '创建队伍',
+    teamName: '队伍名称',
+    teamInviteeHint: '受邀成员用户 ID（逗号分隔，可选）',
+    teamCreateAction: '建队',
+    teamInvitations: '入队邀请',
+    teamNoInvitations: '暂无待处理邀请。',
+    teamInvitedBy: '邀请人',
+    teamId: '队伍',
+    teamAccept: '接受',
+    teamReject: '拒绝',
+    teamEmpty: '你还没有加入任何队伍。',
+    teamCaptain: '队长',
+    teamMembers: '成员',
+    teamInvite: '邀请',
+    teamLeave: '退出',
+    teamUserId: '用户 ID',
+    teamLeaderPays: '团队任务奖励全额发放给队长，由队长自行分配。',
+    teamLoading: '处理中...',
     heroLabel: 'TASK BOARD',
     heroTitle1: '任务',
     heroTitle2: '发布板',
@@ -679,6 +727,16 @@ export const zhCN: ToolsMessages = {
     submitting: '提交中...',
     submit: '提交',
     rejectReasonPrompt: '请输入驳回原因',
+    transferTitle: '[ 灵石转账 ]',
+    transferRecipientHint: '搜索收款人（用户名/展示名，至少 3 个字符）',
+    transferSearch: '搜索',
+    transferAmount: '金额',
+    transferRemark: '备注（可选）',
+    transferAction: '确认转账',
+    transferSuccess: '转账成功',
+    transferNoRecipient: '未找到收款人',
+    entriesTitle: '[ 最近流水 ]',
+    entriesEmpty: '暂无流水。',
   },
   toolsDevCenter: {
     heroLabel: '开发者中心',
@@ -1116,7 +1174,26 @@ export const en: ToolsMessages = {
   toolsTask: {
     tabBoard: 'Task Board',
     tabMyClaims: 'My Claims',
+    tabTeams: 'My Teams',
     tabPoints: 'Points',
+    teamCreate: 'Create Team',
+    teamName: 'Team name',
+    teamInviteeHint: 'Invitee user IDs (comma separated, optional)',
+    teamCreateAction: 'Create',
+    teamInvitations: 'Invitations',
+    teamNoInvitations: 'No pending invitations.',
+    teamInvitedBy: 'Invited by',
+    teamId: 'Team',
+    teamAccept: 'Accept',
+    teamReject: 'Reject',
+    teamEmpty: 'You have not joined any team yet.',
+    teamCaptain: 'Captain',
+    teamMembers: 'Members',
+    teamInvite: 'Invite',
+    teamLeave: 'Leave',
+    teamUserId: 'User ID',
+    teamLeaderPays: 'Team rewards are paid in full to the captain, who distributes them.',
+    teamLoading: 'Working...',
     heroLabel: 'TASK BOARD',
     heroTitle1: 'Task',
     heroTitle2: 'Board',
@@ -1215,6 +1292,16 @@ export const en: ToolsMessages = {
     submitting: 'Submitting...',
     submit: 'Submit',
     rejectReasonPrompt: 'Enter the reject reason',
+    transferTitle: '[ Spirit Stone Transfer ]',
+    transferRecipientHint: 'Search recipient (username/display name, at least 3 chars)',
+    transferSearch: 'Search',
+    transferAmount: 'Amount',
+    transferRemark: 'Remark (optional)',
+    transferAction: 'Transfer',
+    transferSuccess: 'Transfer completed',
+    transferNoRecipient: 'No recipient found',
+    entriesTitle: '[ Recent Entries ]',
+    entriesEmpty: 'No entries yet.',
   },
   toolsDevCenter: {
     heroLabel: 'Dev Center',

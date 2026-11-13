@@ -10,7 +10,7 @@
 import { Clock, CheckCircle, XCircle, Hourglass, Send, Zap } from 'lucide-react';
 import { INPUT_CLASS } from '@/shared/utils/ui-constants';
 
-export type TaskTab = 'board' | 'my-claims' | 'points';
+export type TaskTab = 'board' | 'my-claims' | 'teams' | 'points';
 
 /** 官网英文任务状态（与后端 legacy_task_client 中文→英文映射表一致） */
 export const TASK_STATUSES = [
@@ -58,6 +58,62 @@ export interface TaskData {
   reviewedAt: string | null;
   createdAt: string;
   updatedAt: string;
+  /** 统一后端版本号（PATCH/归档的 If-Match） */
+  version: number;
+}
+
+/** 原生 /tasks 响应（camelCase）→ 页面 TaskData 视图模型 */
+export function toTaskData(input: unknown): TaskData {
+  const task = (input ?? {}) as Record<string, unknown>;
+  return {
+    id: String(task.id ?? ''),
+    title: String(task.title ?? ''),
+    description: (task.description as string | null) ?? null,
+    difficulty: (task.difficulty as string | null) ?? null,
+    techRequirements: Array.isArray(task.tags) ? (task.tags as string[]) : [],
+    reward: Number(task.rewardTotal ?? task.reward_total ?? 0),
+    deadline: (task.deadline as string | null) ?? null,
+    status: String(task.status ?? 'published'),
+    statusLabel: null,
+    publisherId: task.publisherId != null ? String(task.publisherId) : null,
+    publisherName: (task.publisherName as string | null) ?? null,
+    publisherAvatar: null,
+    completer: null,
+    submissionDescription: null,
+    attachmentUrl: null,
+    rejectReason: null,
+    reviewedBy: null,
+    reviewedAt: (task.reviewedAt as string | null) ?? null,
+    createdAt: String(task.createdAt ?? ''),
+    updatedAt: String(task.updatedAt ?? ''),
+    version: Number(task.version ?? 1),
+  };
+}
+
+/** 原生 claims 响应 → 页面 ClaimData 视图模型 */
+export function toClaimData(input: unknown): ClaimData {
+  const claim = (input ?? {}) as Record<string, unknown>;
+  const submission = (claim.submission ?? null) as Record<string, unknown> | null;
+  const rawStatus = String(claim.status ?? 'active');
+  // 页面沿用旧状态机：active 视作「进行中」，提交后为 submitted。
+  const status = rawStatus === 'active' ? 'in_progress' : rawStatus;
+  const task = claim.task ? toTaskData(claim.task) : null;
+  if (task && submission) {
+    task.submissionDescription = (submission.description as string | null) ?? null;
+    const attachments = Array.isArray(submission.attachments) ? submission.attachments : [];
+    task.attachmentUrl = attachments.length ? String(attachments[0]) : null;
+    if (String(submission.reviewStatus ?? '') === 'rejected') {
+      task.rejectReason = (submission.reviewNote as string | null) ?? null;
+    }
+  }
+  return {
+    id: String(claim.id ?? ''),
+    taskId: String(claim.taskId ?? claim.task_id ?? ''),
+    status,
+    statusLabel: null,
+    createdAt: String(claim.startedAt ?? claim.createdAt ?? ''),
+    task,
+  };
 }
 
 /** 我的任务条目：单接取人模型下「任务即认领」 */

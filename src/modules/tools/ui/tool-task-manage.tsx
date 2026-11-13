@@ -1,9 +1,8 @@
 /**
- * @file 任务管理子面板 — 管理端待审核任务（旧项目「审核中」）
+ * @file 任务管理子面板 — 管理端待审核任务（统一后端原生 /admin/tasks）
  *
- * 旧项目无「草稿 / 发布 / 关闭」概念：官网管理端只负责建单后的审核
- * （通过 → 等待中；驳回 → 已驳回），其余流转在旧项目自有后台完成。
- * 数据源：官网后端 BFF 代理 `/api/admin/tools/task`（GET 待审核 / POST approve·reject·delete）。
+ * 审核通过时后端原子托管奖励；驳回必须填写原因。
+ * 数据源：/api/admin/tasks（GET 待审核 / POST reviews / DELETE 归档）。
  */
 'use client';
 
@@ -12,7 +11,7 @@ import { useTranslations } from 'next-intl';
 import { Button } from '@/components';
 import { Check, X } from 'lucide-react';
 import { formatDate } from './tool-types';
-import { difficultyLabel, statusBadge, type TaskData } from './task-shared';
+import { difficultyLabel, statusBadge, toTaskData, type TaskData } from './task-shared';
 import { apiRequest } from '@/shared/hooks/use-api-request';
 
 /** 任务管理子面板 — 待审核任务列表 + 审核通过 / 驳回 / 删除 */
@@ -29,9 +28,11 @@ export function TaskManagePanel() {
     setTaskLoading(true);
     setTaskError(null);
     try {
-      const r = await apiRequest<{ tasks?: TaskData[] }>('/api/admin/tools/task');
+      const r = await apiRequest<{ items?: Record<string, unknown>[] }>(
+        '/api/admin/tasks?status=pending_review&limit=50',
+      );
       if (r.ok) {
-        setTasks(r.data?.tasks || []);
+        setTasks((r.data?.items || []).map(toTaskData));
       } else {
         setTaskError(r.error ?? t('loadFailed'));
       }
@@ -51,7 +52,10 @@ export function TaskManagePanel() {
     async (taskId: string, body: Record<string, unknown>, fallback: string) => {
       setActingId(taskId);
       try {
-        const r = await apiRequest('/api/admin/tools/task', { method: 'POST', body });
+        const r = await apiRequest(`/api/admin/tasks/${taskId}/reviews`, {
+          method: 'POST',
+          body,
+        });
         if (!r.ok) {
           alert(r.error ?? fallback);
         } else {
@@ -66,16 +70,35 @@ export function TaskManagePanel() {
     [t],
   );
 
-  const handleApprove = (taskId: string) => act(taskId, { action: 'approve', taskId }, t('taskApproveFailed'));
+  const handleApprove = (taskId: string) =>
+    act(taskId, { decision: 'approve' }, t('taskApproveFailed'));
 
   const handleReject = (taskId: string) => {
     const reason = window.prompt(tt('rejectReasonPrompt')) ?? '';
-    act(taskId, { action: 'reject', taskId, reason }, t('taskRejectFailed'));
+    if (!reason.trim()) return;
+    act(taskId, { decision: 'reject', note: reason }, t('taskRejectFailed'));
   };
 
-  const handleDelete = (taskId: string) => {
+  const handleDelete = async (taskId: string) => {
     if (!window.confirm(t('deleteConfirm'))) return;
-    act(taskId, { action: 'delete', taskId }, t('taskDeleteFailed'));
+    const target = tasks.find((x) => x.id === taskId);
+    if (!target) return;
+    setActingId(taskId);
+    try {
+      const r = await apiRequest(`/api/tasks/${taskId}`, {
+        method: 'DELETE',
+        headers: { 'If-Match': String(target.version) },
+      });
+      if (!r.ok) {
+        alert(r.error ?? t('taskDeleteFailed'));
+      } else {
+        setTasks((prev) => prev.filter((x) => x.id !== taskId));
+      }
+    } catch {
+      alert(t('networkError'));
+    } finally {
+      setActingId(null);
+    }
   };
 
   return (

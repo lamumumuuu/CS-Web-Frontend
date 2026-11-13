@@ -42,7 +42,7 @@ export function MyClaimsTab(props: ReturnType<typeof useTasks>) {
               key={claim.id}
               claim={claim}
               t={t}
-              submitting={submittingId === claim.taskId}
+              submitting={submittingId === claim.id}
               onSubmit={handleSubmitResult}
             />
           ))}
@@ -62,7 +62,7 @@ function ClaimRow({
   claim: ClaimData;
   t: TFn;
   submitting: boolean;
-  onSubmit: (taskId: string, description: string, attachmentUrl: string) => Promise<boolean>;
+  onSubmit: (claimId: string, description: string, attachmentUrl: string) => Promise<boolean>;
 }) {
   const task = claim.task;
   const badge = statusBadge(claim.status, t, claim.statusLabel);
@@ -123,7 +123,7 @@ function ClaimRow({
         <form
           onSubmit={async (e) => {
             e.preventDefault();
-            const ok = await onSubmit(claim.taskId, description, attachmentUrl);
+            const ok = await onSubmit(claim.id, description, attachmentUrl);
             if (ok) {
               setDescription('');
               setAttachmentUrl('');

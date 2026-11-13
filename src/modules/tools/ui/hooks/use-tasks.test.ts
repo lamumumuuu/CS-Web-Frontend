@@ -10,20 +10,16 @@ vi.mock('next-intl', () => ({
 import { useTasks } from './use-tasks';
 
 /**
- * useTasks 单测（GENERAL 3.8「tests 覆盖拆分后组件」、2.4「拆分即补测」）
- * mock fetch，聚焦挂载加载、难度筛选、接取与建单。
- * 任务数据源为旧项目（BFF 代理）：单接取人模型，无多名额 / 取消接取。
+ * useTasks 单测：任务数据已切到统一后端原生 /api/tasks。
  */
 
 const mockUser = { id: 'u1', role: 'member' };
 
 const mockTasks = [
   {
-    id: 't1', title: '任务A', description: 'd', difficulty: '黑铁', techRequirements: [],
-    reward: 10, deadline: null, status: 'published', statusLabel: '等待中',
-    publisherId: null, publisherName: null, publisherAvatar: null, completer: null,
-    submissionDescription: null, attachmentUrl: null, rejectReason: null,
-    reviewedBy: null, reviewedAt: null, createdAt: '2024-01-01', updatedAt: '2024-01-01',
+    id: 1, title: '任务A', description: 'd', difficulty: '黑铁', tags: [],
+    rewardTotal: '10', deadline: null, status: 'published',
+    publisherId: 1, publisherName: null, createdAt: '2024-01-01', updatedAt: '2024-01-01',
   },
 ];
 
@@ -41,10 +37,13 @@ function installFetch(overrides: Record<string, () => Response> = {}) {
   const fetchMock = vi.fn().mockImplementation(async (url: string) => {
     if (overrides[url]) return overrides[url]();
     if (url === '/api/auth/me') return res({ user: mockUser });
-    if (url.startsWith('/api/tools/task?')) return res({ tasks: mockTasks });
-    if (url === '/api/tools/task/claims') return res({ claims: [] });
-    if (url === '/api/admin/tools/task') return res({ tasks: [] });
-    if (url.startsWith('/api/tools/task/')) return res({ claim: {} });
+    if (url === '/api/rbac/me/permissions') return res({ permissions: [] });
+    if (url.startsWith('/api/tasks?')) return res({ items: mockTasks });
+    if (url === '/api/tasks/me/claims?limit=50') return res({ items: [] });
+    if (url.startsWith('/api/admin/tasks?')) return res({ items: [] });
+    if (url === '/api/tasks') return res({ id: 2 }, 201);
+    if (url.startsWith('/api/tasks/') && url.endsWith('/review-requests')) return res({ id: 2 });
+    if (url.startsWith('/api/tasks/')) return res({ id: 3 }, 201);
     return res({});
   });
   vi.stubGlobal('fetch', fetchMock);
@@ -65,8 +64,9 @@ describe('useTasks', () => {
     await waitFor(() => expect(result.current.tasksLoading).toBe(false));
 
     expect(fetchMock).toHaveBeenCalledWith('/api/auth/me', expect.anything());
-    expect(fetchMock).toHaveBeenCalledWith('/api/tools/task?status=published&pageSize=50', expect.anything());
+    expect(fetchMock).toHaveBeenCalledWith('/api/tasks?status=published&limit=50', expect.anything());
     expect(result.current.tasks).toHaveLength(1);
+    expect(result.current.tasks[0].reward).toBe(10);
     expect(result.current.user?.id).toBe('u1');
     expect(result.current.filteredTasks).toHaveLength(1);
   });
@@ -88,18 +88,18 @@ describe('useTasks', () => {
     expect(result.current.filteredTasks).toHaveLength(0);
   });
 
-  it('handleClaim 成功：调用接取接口并重新拉取列表', async () => {
+  it('handleClaim 成功：调用原生接取接口并重新拉取列表', async () => {
     const fetchMock = installFetch();
 
     const { result } = renderHook(() => useTasks());
     await waitFor(() => expect(result.current.tasksLoading).toBe(false));
 
     await act(async () => {
-      await result.current.handleClaim('t1');
+      await result.current.handleClaim('1');
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/tools/task/t1/claim',
+      '/api/tasks/1/claims',
       expect.objectContaining({ method: 'POST' }),
     );
     expect(result.current.claimingId).toBeNull();
@@ -108,21 +108,21 @@ describe('useTasks', () => {
   it('handleClaim 失败：alert 且 claimingId 归零', async () => {
     const alertSpy = vi.spyOn(window, 'alert').mockImplementation(() => {});
     installFetch({
-      '/api/tools/task/t1/claim': () => res({ error: '已被接取' }, 400),
+      '/api/tasks/1/claims': () => res({ error: '已被接取' }, 409),
     });
 
     const { result } = renderHook(() => useTasks());
     await waitFor(() => expect(result.current.tasksLoading).toBe(false));
 
     await act(async () => {
-      await result.current.handleClaim('t1');
+      await result.current.handleClaim('1');
     });
 
     expect(alertSpy).toHaveBeenCalledWith('已被接取');
     expect(result.current.claimingId).toBeNull();
   });
 
-  it('handleCreate 成功：关闭表单并重置 newTask', async () => {
+  it('handleCreate 成功：创建草稿并申请上架', async () => {
     const fetchMock = installFetch();
 
     const { result } = renderHook(() => useTasks());
@@ -138,7 +138,11 @@ describe('useTasks', () => {
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/admin/tools/task',
+      '/api/tasks',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/tasks/2/review-requests',
       expect.objectContaining({ method: 'POST' }),
     );
     expect(result.current.showCreateForm).toBe(false);

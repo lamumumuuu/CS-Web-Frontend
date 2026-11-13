@@ -19,6 +19,7 @@ import { AdminLogsPanel } from '@/modules/admin/ui/admin-logs-panel';
 import { AdminRolesPanel } from '@/modules/admin/ui/admin-roles-panel';
 import { AdminJoinPanel } from '@/modules/admin/ui/admin-join-panel';
 import { AdminFeatureVisibilityPanel } from '@/modules/admin/ui/admin-feature-visibility-panel';
+import { AdminOpsPanel } from '@/modules/admin/ui/admin-ops-panel';
 import { useCollapsingHero } from '@/shared/hooks/use-collapsing-hero';
 import { apiRequest } from '@/shared/hooks/use-api-request';
 import { SectionNav } from '@/components/primitives/section-nav';
@@ -42,6 +43,8 @@ function tabTitleKey(tab: AdminTab): string {
       return 'tabTitleLogs';
     case 'feature-visibility':
       return 'tabTitleFeatureVisibility';
+    case 'ops':
+      return 'tabTitleOps';
   }
 }
 
@@ -104,17 +107,20 @@ export default function AdminPage() {
     };
   }, [router]);
 
-  /** 当前登录用户是否为 root（决定 logs Tab 可见性） */
+  /** 当前登录用户是否为 root（决定 logs/可见性 Tab 可见性） */
   const isRootAdmin = currentUser?.role === 'root';
+  /** 角色权限面板：超级管理员与 admin 角色均可进入（后端仍按 role:* 权限校验） */
+  const canManageRoles = isRootAdmin || currentUser?.role === 'admin';
 
-  // 悬浮胶囊侧边栏 Tab 配置（roles / logs 仅 root 可见）
+  // 悬浮胶囊侧边栏 Tab 配置（roles 对 root/admin 可见；logs 仅 root）
   const adminTabs: CapsuleTab[] = [
-    ...(isRootAdmin ? [{ key: 'roles', num: '00', label: t('tabRoles') }] : []),
+    ...(canManageRoles ? [{ key: 'roles', num: '00', label: t('tabRoles') }] : []),
     { key: 'users', num: '01', label: t('tabUsers') },
     { key: 'messages', num: '02', label: t('tabMessages') },
     { key: 'join', num: '03', label: t('tabJoin') },
     ...(isRootAdmin ? [{ key: 'logs', num: '04', label: t('tabLogs') }] : []),
     ...(isRootAdmin ? [{ key: 'feature-visibility', num: '05', label: t('tabFeatureVisibility') }] : []),
+    { key: 'ops', num: '06', label: t('tabOps') },
   ];
 
   /* ============= 渲染：加载中 ============= */
@@ -209,8 +215,8 @@ export default function AdminPage() {
               />
             </div>
 
-            {/* ============ Tab 00 — 角色权限管理（仅 root） ============ */}
-            {activeTab === 'roles' && isRootAdmin && (
+            {/* ============ Tab 00 — 角色权限管理（root/admin） ============ */}
+            {activeTab === 'roles' && canManageRoles && (
               <AdminRolesPanel onForbidden={handleForbidden} />
             )}
 
@@ -238,6 +244,9 @@ export default function AdminPage() {
             {activeTab === 'feature-visibility' && isRootAdmin && (
               <AdminFeatureVisibilityPanel onForbidden={handleForbidden} />
             )}
+
+            {/* ============ Tab 06 — 组织与财务（统一组织/复式账本） ============ */}
+            {activeTab === 'ops' && <AdminOpsPanel />}
           </div>
         </section>
       </main>
